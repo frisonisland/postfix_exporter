@@ -45,19 +45,19 @@ type PostfixExporter struct {
 	logUnsupportedLines bool
 
 	// Metrics that should persist after refreshes, based on logs.
-	cleanupProcesses                prometheus.Counter
-	cleanupRejects                  prometheus.Counter
-	cleanupNotAccepted              prometheus.Counter
-	lmtpDelays                      *prometheus.HistogramVec
-	pipeDelays                      *prometheus.HistogramVec
-	qmgrInsertsNrcpt                prometheus.Histogram
-	qmgrInsertsSize                 prometheus.Histogram
-	qmgrRemoves                     prometheus.Counter
-	qmgrExpires                     prometheus.Counter
-	smtpDelays                      *prometheus.HistogramVec
-	smtpTLSConnects                 *prometheus.CounterVec
-	smtpConnectionTimedOut          prometheus.Counter
-	smtpProcesses                    *prometheus.CounterVec
+	cleanupProcesses       prometheus.Counter
+	cleanupRejects         prometheus.Counter
+	cleanupNotAccepted     prometheus.Counter
+	lmtpDelays             *prometheus.HistogramVec
+	pipeDelays             *prometheus.HistogramVec
+	qmgrInsertsNrcpt       *prometheus.HistogramVec
+	qmgrInsertsSize        *prometheus.HistogramVec
+	qmgrRemoves            prometheus.Counter
+	qmgrExpires            prometheus.Counter
+	smtpDelays             *prometheus.HistogramVec
+	smtpTLSConnects        *prometheus.CounterVec
+	smtpConnectionTimedOut prometheus.Counter
+	smtpProcesses          *prometheus.CounterVec
 	// should be the same as smtpProcesses{status=deferred}, kept for compatibility, but this doesn't work !
 	smtpDeferreds                   prometheus.Counter
 	smtpdConnects                   prometheus.Counter
@@ -70,10 +70,10 @@ type PostfixExporter struct {
 	smtpdTLSConnects                *prometheus.CounterVec
 	unsupportedLogEntries           *prometheus.CounterVec
 	// same as smtpProcesses{status=deferred}, kept for compatibility
-	smtpStatusDeferred              prometheus.Counter
-	opendkimSignatureAdded          *prometheus.CounterVec
-	bounceNonDelivery               prometheus.Counter
-	virtualDelivered                prometheus.Counter
+	smtpStatusDeferred     prometheus.Counter
+	opendkimSignatureAdded *prometheus.CounterVec
+	bounceNonDelivery      prometheus.Counter
+	virtualDelivered       prometheus.Counter
 }
 
 // A LogSource is an interface to read log lines.
@@ -224,7 +224,7 @@ func CollectBinaryShowqFromReader(file io.Reader, ch chan<- prometheus.Metric) e
 			Help:      "Size of messages in Postfix's message queue, in bytes",
 			Buckets:   []float64{1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9},
 		},
-		[]string{"queue"})
+		[]string{"queue", "domain"})
 	ageHistogram := prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: "postfix",
@@ -232,12 +232,12 @@ func CollectBinaryShowqFromReader(file io.Reader, ch chan<- prometheus.Metric) e
 			Help:      "Age of messages in Postfix's message queue, in seconds",
 			Buckets:   []float64{1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8},
 		},
-		[]string{"queue"})
+		[]string{"queue", "domain"})
 
 	// Initialize all queue buckets to zero.
 	for _, q := range []string{"active", "deferred", "hold", "incoming", "maildrop"} {
-		sizeHistogram.WithLabelValues(q)
-		ageHistogram.WithLabelValues(q)
+		sizeHistogram.WithLabelValues(q, "")
+		ageHistogram.WithLabelValues(q, "")
 	}
 
 	now := float64(time.Now().UnixNano()) / 1e9
@@ -254,7 +254,7 @@ func CollectBinaryShowqFromReader(file io.Reader, ch chan<- prometheus.Metric) e
 			return fmt.Errorf("key %q does not have a value", key)
 		}
 		value := scanner.Text()
-
+		log.Printf("Key: %s, Value: %s\n", key, value)
 		if key == "queue_name" {
 			// The name of the message queue.
 			queue = value
@@ -264,14 +264,14 @@ func CollectBinaryShowqFromReader(file io.Reader, ch chan<- prometheus.Metric) e
 			if err != nil {
 				return err
 			}
-			sizeHistogram.WithLabelValues(queue).Observe(size)
+			sizeHistogram.WithLabelValues(queue, "").Observe(size)
 		} else if key == "time" {
 			// Message time as a UNIX timestamp.
 			utime, err := strconv.ParseFloat(value, 64)
 			if err != nil {
 				return err
 			}
-			ageHistogram.WithLabelValues(queue).Observe(now - utime)
+			ageHistogram.WithLabelValues(queue, "").Observe(now - utime)
 		}
 	}
 
@@ -294,7 +294,7 @@ func CollectShowqFromSocket(path string, ch chan<- prometheus.Metric) error {
 var (
 	logLine                             = regexp.MustCompile(` ?(postfix|opendkim)(/(\w+))?\[\d+\]: ((?:(warning|error|fatal|panic): )?.*)`)
 	lmtpPipeSMTPLine                    = regexp.MustCompile(`, relay=(\S+), .*, delays=([0-9\.]+)/([0-9\.]+)/([0-9\.]+)/([0-9\.]+), `)
-	qmgrInsertLine                      = regexp.MustCompile(`:.*, size=(\d+), nrcpt=(\d+) `)
+	qmgrInsertLine                      = regexp.MustCompile(`:.* from=<([\w-\.]+@((?:[\w-]+\.)+[\w-]{2,4}))>, size=(\d+), nrcpt=(\d+)`)
 	qmgrExpiredLine                     = regexp.MustCompile(`:.*, status=(expired|force-expired), returned to sender`)
 	smtpStatusLine                      = regexp.MustCompile(`, status=(\w+) `)
 	smtpTLSLine                         = regexp.MustCompile(`^(\S+) TLS connection established to \S+: (\S+) with cipher (\S+) \((\d+)/(\d+) bits\)`)
@@ -355,8 +355,10 @@ func (e *PostfixExporter) CollectFromLogLine(line string) {
 			}
 		case "qmgr":
 			if qmgrInsertMatches := qmgrInsertLine.FindStringSubmatch(remainder); qmgrInsertMatches != nil {
-				addToHistogram(e.qmgrInsertsSize, qmgrInsertMatches[1], "QMGR size")
-				addToHistogram(e.qmgrInsertsNrcpt, qmgrInsertMatches[2], "QMGR nrcpt")
+				log.Printf("Received: %v\n", qmgrInsertMatches)
+				domain := qmgrInsertMatches[2]
+				addToHistogramVec(e.qmgrInsertsSize, qmgrInsertMatches[3], "QMGR size", domain)
+				addToHistogramVec(e.qmgrInsertsNrcpt, qmgrInsertMatches[4], "QMGR nrcpt", domain)
 			} else if strings.HasSuffix(remainder, ": removed") {
 				e.qmgrRemoves.Inc()
 			} else if qmgrExpired := qmgrExpiredLine.FindStringSubmatch(remainder); qmgrExpired != nil {
@@ -493,18 +495,18 @@ func NewPostfixExporter(showqPath string, logSrc LogSource, logUnsupportedLines 
 				Buckets:   timeBuckets,
 			},
 			[]string{"relay", "stage"}),
-		qmgrInsertsNrcpt: prometheus.NewHistogram(prometheus.HistogramOpts{
+		qmgrInsertsNrcpt: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "postfix",
 			Name:      "qmgr_messages_inserted_receipients",
 			Help:      "Number of receipients per message inserted into the mail queues.",
 			Buckets:   []float64{1, 2, 4, 8, 16, 32, 64, 128},
-		}),
-		qmgrInsertsSize: prometheus.NewHistogram(prometheus.HistogramOpts{
+		}, []string{"domain"}),
+		qmgrInsertsSize: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "postfix",
 			Name:      "qmgr_messages_inserted_size_bytes",
 			Help:      "Size of messages inserted into the mail queues in bytes.",
 			Buckets:   []float64{1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9},
-		}),
+		}, []string{"domain"}),
 		qmgrRemoves: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "postfix",
 			Name:      "qmgr_messages_removed_total",
@@ -640,8 +642,8 @@ func (e *PostfixExporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.cleanupNotAccepted.Desc()
 	e.lmtpDelays.Describe(ch)
 	e.pipeDelays.Describe(ch)
-	ch <- e.qmgrInsertsNrcpt.Desc()
-	ch <- e.qmgrInsertsSize.Desc()
+	e.qmgrInsertsNrcpt.Describe(ch)
+	e.qmgrInsertsSize.Describe(ch)
 	ch <- e.qmgrRemoves.Desc()
 	ch <- e.qmgrExpires.Desc()
 	e.smtpDelays.Describe(ch)
@@ -719,8 +721,8 @@ func (e *PostfixExporter) Collect(ch chan<- prometheus.Metric) {
 	ch <- e.cleanupNotAccepted
 	e.lmtpDelays.Collect(ch)
 	e.pipeDelays.Collect(ch)
-	ch <- e.qmgrInsertsNrcpt
-	ch <- e.qmgrInsertsSize
+	e.qmgrInsertsNrcpt.Collect(ch)
+	e.qmgrInsertsSize.Collect(ch)
 	ch <- e.qmgrRemoves
 	ch <- e.qmgrExpires
 	e.smtpDelays.Collect(ch)
